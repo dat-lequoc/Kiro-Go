@@ -80,13 +80,23 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
 			}
-			out := stringifyArbitrary(obj["output"])
-			if out == "" {
-				out = stringifyArbitrary(obj["content"])
+			rawOut := obj["output"]
+			if rawOut == nil {
+				rawOut = obj["content"]
+			}
+			var toolContent interface{}
+			if parts := toolOutputParts(rawOut); parts != nil {
+				toolContent = parts
+			} else {
+				out := stringifyArbitrary(obj["output"])
+				if out == "" {
+					out = stringifyArbitrary(obj["content"])
+				}
+				toolContent = out
 			}
 			messages = append(messages, OpenAIMessage{
 				Role:       "tool",
-				Content:    out,
+				Content:    toolContent,
 				ToolCallID: callID,
 			})
 
@@ -229,3 +239,40 @@ func stringField(obj map[string]interface{}, keys ...string) string {
 	}
 	return ""
 }
+
+// toolOutputParts inspects a function_call_output payload and, when it carries
+// structured multimodal parts (notably images), returns them as a normalized
+// []interface{} so downstream conversion treats images as vision input instead
+// of stringifying the base64 data-URI into plain text. Returns nil when the
+// output has no image parts, so callers fall back to plain text handling.
+func toolOutputParts(raw interface{}) []interface{} {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	hasImage := false
+	parts := make([]interface{}, 0, len(arr))
+	for _, p := range arr {
+		part, ok := p.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		ptype, _ := part["type"].(string)
+		switch ptype {
+		case "input_image", "image", "image_url":
+			hasImage = true
+			parts = append(parts, part)
+		case "input_text", "text", "output_text":
+			if t, ok := part["text"].(string); ok {
+				parts = append(parts, map[string]interface{}{"type": "input_text", "text": t})
+			}
+		default:
+			parts = append(parts, part)
+		}
+	}
+	if !hasImage {
+		return nil
+	}
+	return parts
+}
+
