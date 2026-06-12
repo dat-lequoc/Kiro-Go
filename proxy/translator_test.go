@@ -471,6 +471,15 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	}
 }
 
+func TestMapModelRoutesOpus47ToAvailableUpstream(t *testing.T) {
+	if got := MapModel("claude-opus-4.7"); got != "claude-opus-4.6" {
+		t.Fatalf("MapModel(claude-opus-4.7) = %q, want claude-opus-4.6", got)
+	}
+	if got := MapModel("claude-opus-4.8"); got != "claude-opus-4.8" {
+		t.Fatalf("MapModel(claude-opus-4.8) = %q, want claude-opus-4.8", got)
+	}
+}
+
 func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	const imgData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	req := &ClaudeRequest{
@@ -526,6 +535,13 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
+			{Role: "user", Content: "inspect this screenshot"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "tool_use", "id": "tool_2", "name": "read", "input": map[string]interface{}{"path": "a.png"}},
+				},
+			},
 			{
 				Role: "user",
 				Content: []interface{}{
@@ -626,9 +642,12 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, toolResultsContinuationPrefix) {
 			toolHistImages += len(h.UserInputMessage.Images)
+			if h.UserInputMessage.UserInputMessageContext != nil &&
+				len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+				t.Fatalf("historical tool results should be flattened before upstream send")
+			}
 		}
 	}
 	if toolHistImages != 1 {

@@ -13,13 +13,18 @@ import (
 	"time"
 )
 
+// kiroRestAPIBase is the historical us-east-1 control-plane host. Data-plane
+// calls now derive their base from the account's profile region via
+// restBaseURL(dataPlaneRegion(account)); this constant remains the us-east-1
+// default that restBaseURL returns.
 const (
 	kiroRestAPIBase = "https://codewhisperer.us-east-1.amazonaws.com"
 )
 
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
-	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
+	base := restBaseURL(dataPlaneRegion(account))
+	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", base)
 	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -49,7 +54,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 // GetUserInfo 获取用户信息
 func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
-	url := fmt.Sprintf("%s/GetUserInfo", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/GetUserInfo", restBaseURL(dataPlaneRegion(account)))
 
 	payload := `{"origin":"KIRO_IDE"}`
 	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
@@ -80,7 +85,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 
 // ListAvailableModels 获取可用模型列表
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
-	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", restBaseURL(dataPlaneRegion(account)))
 	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -121,15 +126,26 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
-	// Try ListAvailableProfiles first, retrying on transient failures.
-	profileArn, err := listAvailableProfilesWithRetry(account)
-	if err == nil && profileArn != "" {
-		if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
-			logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+	// Probe candidate data-plane regions for the profile. The account's profile
+	// may live in a region different from its IdC/auth region (account.Region),
+	// so we cannot assume us-east-1. The first region returning a profile wins;
+	// the ARN itself records the authoritative region for all later calls.
+	var lastErr error
+	for _, region := range candidateProfileRegions(account) {
+		profileArn, err := listAvailableProfilesWithRetry(account, region)
+		if err == nil && profileArn != "" {
+			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
+				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+			}
+			account.ProfileArn = profileArn
+			logger.Infof("[ProfileArn] Resolved profile for %s in region %s: %s", account.Email, region, profileArn)
+			return profileArn, nil
 		}
-		account.ProfileArn = profileArn
-		return profileArn, nil
+		if err != nil {
+			lastErr = err
+		}
 	}
+	_ = lastErr
 
 	// Fallback: refresh token to get profileArn from auth response
 	if account.RefreshToken != "" {
@@ -146,7 +162,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	return "", fmt.Errorf("no available Kiro profile")
 }
 
-func listAvailableProfilesWithRetry(account *config.Account) (string, error) {
+func listAvailableProfilesWithRetry(account *config.Account, region string) (string, error) {
 	// Retry transient failures (network errors, 5xx, 429) with short backoff.
 	// An empty profile list or 4xx (other than 429) is treated as authoritative
 	// and not retried — they reflect account state, not upstream flakiness.
@@ -155,7 +171,7 @@ func listAvailableProfilesWithRetry(account *config.Account) (string, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		profileArn, err := listAvailableProfiles(account)
+		profileArn, err := listAvailableProfiles(account, region)
 		if err == nil {
 			return profileArn, nil
 		}
@@ -189,8 +205,8 @@ func isTransientProfileFetchError(err error) bool {
 	return true
 }
 
-func listAvailableProfiles(account *config.Account) (string, error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), strings.NewReader(`{"maxResults":10}`))
+func listAvailableProfiles(account *config.Account, region string) (string, error) {
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/ListAvailableProfiles", restBaseURL(region)), strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
 	}
@@ -250,6 +266,17 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	info := &config.AccountInfo{
 		LastRefresh: time.Now().Unix(),
+	}
+
+	// Ensure the data-plane region is known before calling usage. The account's
+	// Kiro profile may live in a region different from its IdC/auth region; with
+	// an empty profile ARN GetUsageLimits would fall back to us-east-1, get a 403,
+	// and the account would be wrongly banned as a token failure. Resolving the
+	// profile first (best-effort) routes the call to the correct region.
+	if strings.TrimSpace(account.ProfileArn) == "" {
+		if _, resolveErr := ResolveProfileArn(account); resolveErr != nil {
+			logger.Debugf("[RefreshAccountInfo] Could not resolve profile ARN for %s before usage: %v", account.Email, resolveErr)
+		}
 	}
 
 	// 获取使用量和订阅信息

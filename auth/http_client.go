@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"kiro-go/netproxy"
 	"net/http"
 	"net/url"
 	"sync"
@@ -35,21 +36,25 @@ func GetAuthClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
+		Transport: buildAuthRoundTripper(proxyURL),
 	}
 	authProxyClientCache.Store(proxyURL, client)
 	return client
 }
 
-// buildAuthTransport 构建带可选代理的 Transport
-func buildAuthTransport(proxyURL string) *http.Transport {
-	t := &http.Transport{
+func newAuthTransport() *http.Transport {
+	return &http.Transport{
 		MaxIdleConns:        50,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 	}
+}
+
+// buildAuthTransport 构建带可选标准代理的 Transport
+func buildAuthTransport(proxyURL string) *http.Transport {
+	t := newAuthTransport()
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
@@ -61,11 +66,20 @@ func buildAuthTransport(proxyURL string) *http.Transport {
 	return t
 }
 
+func buildAuthRoundTripper(proxyURL string) http.RoundTripper {
+	t := newAuthTransport()
+	rt, err := netproxy.BuildRoundTripper(proxyURL, t)
+	if err != nil {
+		return t
+	}
+	return rt
+}
+
 // InitHttpClient 初始化（或重新初始化）auth 模块的全局 HTTP 客户端
 func InitHttpClient(proxyURL string) {
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
+		Transport: buildAuthRoundTripper(proxyURL),
 	}
 	httpClientStore.Store(client)
 }

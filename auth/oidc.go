@@ -23,11 +23,11 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
-	// Resolve per-account proxy: account.ProxyURL > global config
-	proxyURL := account.ProxyURL
-	if proxyURL == "" {
-		proxyURL = config.GetProxyURL()
-	}
+	// Token refresh is control-plane auth traffic, not Kiro serving traffic.
+	// Per-account relay URLs are meant for AWS/Kiro runtime calls and can time
+	// out on oidc.* token endpoints, leaving otherwise valid imported accounts
+	// without refreshed usage metadata. Honor only the global auth proxy here.
+	proxyURL := config.GetProxyURL()
 	client := GetAuthClientForProxy(proxyURL)
 
 	if account.AuthMethod == "social" {

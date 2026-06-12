@@ -9,6 +9,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/netproxy"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -29,25 +30,32 @@ type kiroEndpoint struct {
 	Name      string
 }
 
-var kiroEndpoints = []kiroEndpoint{
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "",
-		Name:      "Kiro IDE",
-	},
-	{
-		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-		Name:      "CodeWhisperer",
-	},
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ",
-	},
+// kiroEndpoints, when non-nil, overrides the region-derived endpoint list.
+// Production leaves it nil (endpoints are built per-account from the data-plane
+// region); tests set it to point the streaming client at a local server.
+var kiroEndpoints []kiroEndpoint
+
+// buildKiroEndpoints returns the streaming endpoints for an account's data-plane
+// region (derived from its profile ARN). Outside us-east-1 the codewhisperer.*
+// host does not resolve, so the regional q.* host is used for every variant.
+func buildKiroEndpoints(region string) []kiroEndpoint {
+	if kiroEndpoints != nil {
+		return kiroEndpoints
+	}
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	q := "https://q." + region + ".amazonaws.com/generateAssistantResponse"
+	cw := "https://codewhisperer." + region + ".amazonaws.com/generateAssistantResponse"
+	if region != "us-east-1" {
+		cw = q
+	}
+	return []kiroEndpoint{
+		{URL: q, Origin: "AI_EDITOR", AmzTarget: "", Name: "Kiro IDE"},
+		{URL: cw, Origin: "AI_EDITOR", AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse", Name: "CodeWhisperer"},
+		{URL: q, Origin: "AI_EDITOR", AmzTarget: "AmazonQDeveloperStreamingService.SendMessage", Name: "AmazonQ"},
+	}
 }
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
@@ -72,7 +80,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   5 * time.Minute,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: buildKiroRoundTripper(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
 	return client
@@ -90,7 +98,7 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: buildKiroRoundTripper(proxyURL),
 	}
 	proxyClientCache.Store(cacheKey, client)
 	return client
@@ -105,15 +113,19 @@ func ResolveAccountProxyURL(account *config.Account) string {
 	return config.GetProxyURL()
 }
 
-// buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
-func buildKiroTransport(proxyURL string) *http.Transport {
-	t := &http.Transport{
+func newKiroTransport() *http.Transport {
+	return &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 	}
+}
+
+// buildKiroTransport constructs an HTTP Transport with optional standard proxy support.
+func buildKiroTransport(proxyURL string) *http.Transport {
+	t := newKiroTransport()
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
@@ -126,17 +138,27 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 	return t
 }
 
+func buildKiroRoundTripper(proxyURL string) http.RoundTripper {
+	t := newKiroTransport()
+	rt, err := netproxy.BuildRoundTripper(proxyURL, t)
+	if err != nil {
+		logger.Warnf("[Proxy] Invalid proxy URL %q: %v", proxyURL, err)
+		return t
+	}
+	return rt
+}
+
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
 		Timeout:   5 * time.Minute,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: buildKiroRoundTripper(proxyURL),
 	}
 	kiroHttpStore.Store(client)
 
 	restClient := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: buildKiroRoundTripper(proxyURL),
 	}
 	kiroRestHttpStore.Store(restClient)
 }
@@ -256,8 +278,10 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 	}
 }
 
-// getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
-func getSortedEndpoints(preferred string) []kiroEndpoint {
+// getSortedEndpoints returns endpoints ordered by user preference, with optional
+// fallback. Endpoints are built for the given data-plane region.
+func getSortedEndpoints(preferred, region string) []kiroEndpoint {
+	endpoints := buildKiroEndpoints(region)
 	fallback := config.GetEndpointFallback()
 
 	var primary int
@@ -269,18 +293,23 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		// "auto": all endpoints in order (Kiro first, then fallbacks).
+		return endpoints
+	}
+
+	// Guard against an override list shorter than the selected index.
+	if primary >= len(endpoints) {
+		primary = 0
 	}
 
 	if !fallback {
 		// No fallback: only use the selected endpoint
-		return []kiroEndpoint{kiroEndpoints[primary]}
+		return []kiroEndpoint{endpoints[primary]}
 	}
 
 	// With fallback: selected first, then others in order
-	result := []kiroEndpoint{kiroEndpoints[primary]}
-	for i, ep := range kiroEndpoints {
+	result := []kiroEndpoint{endpoints[primary]}
+	for i, ep := range endpoints {
 		if i != primary {
 			result = append(result, ep)
 		}
@@ -334,8 +363,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// Build endpoint list ordered by configuration, for this account's
+	// data-plane region (profile ARN region, falling back to us-east-1).
+	endpoints := getSortedEndpoints(config.GetPreferredEndpoint(), dataPlaneRegion(account))
 
 	var lastErr error
 	for _, ep := range endpoints {

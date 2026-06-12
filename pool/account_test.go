@@ -8,21 +8,25 @@ import (
 	"time"
 )
 
-func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
+func TestOverLimitAccountsCanBeSelectedByDefault(t *testing.T) {
 	p := &AccountPool{}
 	normal := config.Account{ID: "normal"}
 	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10}
 
 	p.accounts = []config.Account{normal, overLimit}
 
+	seenOverLimit := false
 	for i := 0; i < 5; i++ {
 		acc := p.GetNext()
 		if acc == nil {
 			t.Fatalf("expected an account")
 		}
 		if acc.ID == "over" {
-			t.Fatalf("expected over-limit account to be skipped when upstream OverageStatus is empty")
+			seenOverLimit = true
 		}
+	}
+	if !seenOverLimit {
+		t.Fatalf("expected over-limit account to remain selectable when upstream OverageStatus is empty")
 	}
 }
 
@@ -46,7 +50,7 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 	}
 }
 
-func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T) {
+func TestOverLimitAccountsRemainSelectableWhenUpstreamOverageDisabled(t *testing.T) {
 	p := &AccountPool{}
 	overLimit := config.Account{
 		ID:            "over",
@@ -57,8 +61,8 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 
 	p.accounts = []config.Account{overLimit}
 
-	if acc := p.GetNext(); acc != nil {
-		t.Fatalf("expected nil when upstream OverageStatus=DISABLED, got %q", acc.ID)
+	if acc := p.GetNext(); acc == nil || acc.ID != "over" {
+		t.Fatalf("expected over-limit account to remain selectable with hard-coded over-usage, got %#v", acc)
 	}
 }
 
@@ -171,6 +175,7 @@ func newTestPool(accounts ...config.Account) *AccountPool {
 		cooldowns:   make(map[string]time.Time),
 		errorCounts: make(map[string]int),
 		modelLists:  make(map[string]map[string]bool),
+		affinity:    make(map[string]affinityBinding),
 	}
 	p.accounts = accounts
 	return p
@@ -206,6 +211,55 @@ func TestGetNextForModelExcludingReturnsNilOnEmptyPool(t *testing.T) {
 	acc := p.GetNextForModelExcluding("model", map[string]bool{})
 	if acc != nil {
 		t.Fatalf("expected nil for empty pool, got %q", acc.ID)
+	}
+}
+
+func TestGetNextForModelWithAffinityReturnsBoundAccount(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordAffinitySuccess("conversation:1", "b")
+
+	got := p.GetNextForModelWithAffinity("model", "conversation:1", nil)
+	if got == nil {
+		t.Fatal("expected bound account")
+	}
+	if got.ID != "b" {
+		t.Fatalf("expected bound account b, got %q", got.ID)
+	}
+}
+
+func TestGetNextForModelWithAffinitySkipsExcludedBoundAccount(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordAffinitySuccess("conversation:1", "b")
+
+	got := p.GetNextForModelWithAffinity("model", "conversation:1", map[string]bool{"b": true})
+	if got == nil {
+		t.Fatal("expected fallback account")
+	}
+	if got.ID == "b" {
+		t.Fatalf("expected excluded bound account to be skipped, got %q", got.ID)
+	}
+}
+
+func TestGetNextForModelWithAffinitySkipsCoolingBoundAccount(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordAffinitySuccess("conversation:1", "b")
+	p.cooldowns["b"] = time.Now().Add(time.Minute)
+
+	got := p.GetNextForModelWithAffinity("model", "conversation:1", nil)
+	if got == nil {
+		t.Fatal("expected fallback account")
+	}
+	if got.ID == "b" {
+		t.Fatalf("expected cooling bound account to be skipped, got %q", got.ID)
 	}
 }
 
@@ -304,7 +358,7 @@ func TestReloadKeepsOverQuotaAccountWhenAllowOverUsage(t *testing.T) {
 	}
 }
 
-func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
+func TestReloadKeepsOverQuotaAccountWhenAllowOverUsageSavedDisabled(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -317,11 +371,14 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
+	if err := config.UpdateAllowOverUsage(false); err != nil {
+		t.Fatalf("UpdateAllowOverUsage: %v", err)
+	}
 
 	p := newTestPool()
 	p.Reload()
 
-	if got := p.GetNext(); got != nil {
-		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	if got := p.GetNext(); got == nil || got.ID != "over" {
+		t.Fatalf("expected over-quota account to remain routable with hard-coded over-usage, got %#v", got)
 	}
 }

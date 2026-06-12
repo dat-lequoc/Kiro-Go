@@ -114,6 +114,9 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 
 func MapModel(model string) string {
 	mapped, _ := ParseModelAndThinking(model, "-thinking")
+	if strings.EqualFold(mapped, "claude-opus-4.7") {
+		return "claude-opus-4.6"
+	}
 	return mapped
 }
 

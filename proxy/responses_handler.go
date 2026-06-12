@@ -109,30 +109,37 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	affinityKey := requestAffinityKey(r, nil)
+	if affinityKey == "" && req.PreviousResponseID != "" {
+		affinityKey = "response:" + req.PreviousResponseID
+	}
+	if affinityKey == "" {
+		affinityKey = requestAffinityKey(nil, kiroPayload)
+	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, affinityKey)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, affinityKey)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool, affinityKey string,
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithAffinity(model, affinityKey, excluded)
 		if account == nil {
 			break
 		}
@@ -186,6 +193,8 @@ func (h *Handler) handleResponsesNonStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.pool.RecordAffinitySuccess(affinityKey, account.ID)
+		h.pool.RecordAffinitySuccess("response:"+respID, account.ID)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -272,7 +281,7 @@ func buildResponsesObject(
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool, affinityKey string,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -315,7 +324,7 @@ func (h *Handler) handleResponsesStream(
 	responseStarted := false
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithAffinity(model, affinityKey, excluded)
 		if account == nil {
 			break
 		}
@@ -531,6 +540,8 @@ func (h *Handler) handleResponsesStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.pool.RecordAffinitySuccess(affinityKey, account.ID)
+		h.pool.RecordAffinitySuccess("response:"+respID, account.ID)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 

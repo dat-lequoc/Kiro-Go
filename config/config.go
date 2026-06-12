@@ -820,13 +820,11 @@ func UpdateProxySettings(proxyURL string) error {
 }
 
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
+// This router always keeps Kiro accounts routable past the local quota counter;
+// the upstream Kiro/AWS overage switch still decides whether the request is
+// actually accepted once it reaches Kiro.
 func GetAllowOverUsage() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.AllowOverUsage
+	return true
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.

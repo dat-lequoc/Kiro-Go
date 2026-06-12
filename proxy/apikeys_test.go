@@ -279,11 +279,11 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	if got == nil {
 		t.Fatalf("entry missing")
 	}
-	if got.TokensUsed <= 0 {
-		t.Fatalf("expected TokensUsed to grow, got %d", got.TokensUsed)
+	if got.TokensUsed != 55 {
+		t.Fatalf("expected TokensUsed to equal input+output tokens, got %d want 55", got.TokensUsed)
 	}
-	if got.CreditsUsed <= 0 {
-		t.Fatalf("expected CreditsUsed to grow, got %v", got.CreditsUsed)
+	if got.CreditsUsed != 0.75 {
+		t.Fatalf("expected CreditsUsed=0.75, got %v", got.CreditsUsed)
 	}
 	if got.RequestsCount != 1 {
 		t.Fatalf("expected RequestsCount=1, got %d", got.RequestsCount)

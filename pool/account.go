@@ -11,6 +11,7 @@ import (
 )
 
 const tokenRefreshSkewSeconds int64 = 120
+const affinityTTL = time.Hour
 
 // AccountPool 账号池
 type AccountPool struct {
@@ -21,6 +22,12 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	affinity      map[string]affinityBinding // session/conversation key → account
+}
+
+type affinityBinding struct {
+	AccountID string
+	Expires   time.Time
 }
 
 var (
@@ -35,6 +42,7 @@ func GetPool() *AccountPool {
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
 			modelLists:  make(map[string]map[string]bool),
+			affinity:    make(map[string]affinityBinding),
 		}
 		pool.Reload()
 	})
@@ -118,7 +126,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -183,6 +191,21 @@ func (p *AccountPool) accountHasModel(accountID, model string) bool {
 // 若无账号有该模型列表数据，行为与 GetNext 相同（乐观路由）。
 func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
+}
+
+// GetNextForModelWithAffinity prefers the account previously bound to affinityKey
+// when that account is still usable. Falls back to normal model-aware routing.
+func (p *AccountPool) GetNextForModelWithAffinity(model, affinityKey string, excluded map[string]bool) *config.Account {
+	affinityKey = strings.TrimSpace(affinityKey)
+	if affinityKey != "" {
+		p.mu.RLock()
+		if acc := p.getAffinityAccountLocked(model, affinityKey, excluded, time.Now()); acc != nil {
+			p.mu.RUnlock()
+			return acc
+		}
+		p.mu.RUnlock()
+	}
+	return p.GetNextForModelExcluding(model, excluded)
 }
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
@@ -253,6 +276,57 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		}
 	}
 	return best
+}
+
+func (p *AccountPool) getAffinityAccountLocked(model, affinityKey string, excluded map[string]bool, now time.Time) *config.Account {
+	binding, ok := p.affinity[affinityKey]
+	if !ok || binding.AccountID == "" || now.After(binding.Expires) {
+		return nil
+	}
+	if excluded != nil && excluded[binding.AccountID] {
+		return nil
+	}
+
+	allowOverUsage := config.GetAllowOverUsage()
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if acc.ID != binding.AccountID {
+			continue
+		}
+		if !p.accountHasModel(acc.ID, model) {
+			return nil
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			return nil
+		}
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			return nil
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
+			return nil
+		}
+		return acc
+	}
+	return nil
+}
+
+// RecordAffinitySuccess binds a successful conversation/session to the account
+// that completed it.
+func (p *AccountPool) RecordAffinitySuccess(affinityKey, accountID string) {
+	affinityKey = strings.TrimSpace(affinityKey)
+	accountID = strings.TrimSpace(accountID)
+	if affinityKey == "" || accountID == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.affinity == nil {
+		p.affinity = make(map[string]affinityBinding)
+	}
+	p.affinity[affinityKey] = affinityBinding{
+		AccountID: accountID,
+		Expires:   time.Now().Add(affinityTTL),
+	}
+	p.mu.Unlock()
 }
 
 // GetByID 根据 ID 获取账号
