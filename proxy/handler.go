@@ -570,7 +570,7 @@ func (h *Handler) refreshModelsCache() {
 			continue
 		}
 
-		models, err := ListAvailableModels(account)
+		models, err := listAccountModels(account)
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -600,7 +600,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
-	models, err := ListAvailableModels(account)
+	models, err := listAccountModels(account)
 	if err != nil {
 		return err
 	}
@@ -1262,7 +1262,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.sendClaudeError(w, 503, "api_error", h.pool.UnavailableReason(model))
 		return
 	}
 
@@ -1456,7 +1456,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.sendClaudeError(w, 503, "api_error", h.pool.UnavailableReason(model))
 		return
 	}
 
@@ -1899,7 +1899,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.sendOpenAIError(w, 503, "server_error", h.pool.UnavailableReason(model))
 		return
 	}
 
@@ -1982,7 +1982,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.sendOpenAIError(w, 503, "server_error", h.pool.UnavailableReason(model))
 		return
 	}
 
@@ -2003,6 +2003,11 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	// Kiro Secret Key (ksk_) accounts have no OAuth token to refresh; the
+	// kiro-cli bridge manages the short-lived token internally.
+	if isApiKeyAccount(account) {
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2117,6 +2122,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/apikey" && r.Method == "POST":
+		h.apiImportApiKey(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -2198,6 +2205,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
 			"hasToken":          a.AccessToken != "",
+			"hasApiKey":         a.ApiKey != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -2252,8 +2260,8 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.pool.Reload()
-	// 新账号若已启用且有 token，立即拉取并缓存模型列表
-	if account.Enabled && account.AccessToken != "" {
+	// 新账号若已启用且有凭证（OAuth token 或 ksk_ API key），立即拉取并缓存模型列表
+	if account.Enabled && (account.AccessToken != "" || isApiKeyAccount(&account)) {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
@@ -2322,7 +2330,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 
 	h.pool.Reload()
 	// 账号从禁用→启用时，自动拉取并缓存模型列表
-	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
+	if !oldEnabled && existing.Enabled && (existing.AccessToken != "" || isApiKeyAccount(existing)) {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
@@ -2700,6 +2708,94 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 			"id":    account.ID,
 			"email": account.Email,
 		},
+	})
+}
+
+// apiImportApiKey adds one or more Kiro Secret Key (ksk_) accounts that are
+// served through the kiro-cli bridge. Each key is validated by listing models
+// before the account is persisted, so a bad key fails fast at import time.
+func (h *Handler) apiImportApiKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ApiKey   string `json:"apiKey"`
+		Nickname string `json:"nickname"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	raw := strings.TrimSpace(req.ApiKey)
+	if raw == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "apiKey is required"})
+		return
+	}
+
+	// Support batch import: one key per line.
+	keys := strings.Split(raw, "\n")
+	var imported []map[string]interface{}
+	var errors []string
+
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+
+		account := config.Account{
+			ID:         auth.GenerateAccountID(),
+			Nickname:   req.Nickname,
+			ApiKey:     key,
+			AuthMethod: "apikey",
+			Provider:   "ApiKey",
+			Region:     "us-east-1",
+			Enabled:    true,
+			MachineId:  config.GenerateMachineId(),
+		}
+
+		// Validate the key before persisting: a working ksk_ lists models.
+		if _, err := bridgeListModels(&account); err != nil {
+			errors = append(errors, "key "+config.MaskApiKey(key)+": "+err.Error())
+			continue
+		}
+
+		if err := config.AddAccount(account); err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+
+		imported = append(imported, map[string]interface{}{
+			"id":       account.ID,
+			"nickname": account.Nickname,
+		})
+	}
+
+	h.pool.Reload()
+	for _, acc := range imported {
+		id, _ := acc["id"].(string)
+		if latest := h.pool.GetByID(id); latest != nil {
+			go func(a config.Account) {
+				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for apikey account %s: %v", a.ID, err)
+				}
+			}(*latest)
+		}
+	}
+
+	if len(imported) == 0 && len(errors) > 0 {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   strings.Join(errors, "; "),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"accounts": imported,
+		"errors":   errors,
 	})
 }
 
@@ -3099,6 +3195,17 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
+	// Kiro Secret Key (ksk_) accounts have no usage/subscription REST API; the
+	// kiro-cli bridge owns credit accounting. Report status without calling the
+	// CodeWhisperer data plane (which would 403 without a bearer token).
+	if isApiKeyAccount(account) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "apikey account managed by kiro-cli bridge; no usage refresh required",
+		})
+		return
+	}
+
 	// 先尝试刷新 token（不管是否过期，确保 token 有效）
 	refreshTokenIfNeeded := func() error {
 		if account.RefreshToken == "" {
@@ -3223,6 +3330,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"refreshToken":      account.RefreshToken,
 		"clientId":          account.ClientID,
 		"clientSecret":      account.ClientSecret,
+		"apiKey":            config.MaskApiKey(account.ApiKey),
 		"authMethod":        account.AuthMethod,
 		"provider":          account.Provider,
 		"region":            account.Region,
@@ -3280,7 +3388,7 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := ListAvailableModels(account)
+	models, err := listAccountModels(account)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

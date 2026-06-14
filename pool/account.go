@@ -3,7 +3,10 @@
 package pool
 
 import (
+	"fmt"
 	"kiro-go/config"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,16 +16,26 @@ import (
 const tokenRefreshSkewSeconds int64 = 120
 const affinityTTL = time.Hour
 
+const (
+	quotaBackoffBase        = 5 * time.Second
+	quotaBackoffMax         = 20 * time.Second
+	authCooldownDuration    = 30 * time.Minute
+	AuthFailureBanThreshold = 3
+)
+
+var retryAfterPattern = regexp.MustCompile(`(?i)retry[- ]after(?:\s*[:=])?\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?`)
+
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
-	affinity      map[string]affinityBinding // session/conversation key → account
+	mu                sync.RWMutex
+	accounts          []config.Account
+	totalAccounts     int
+	currentIndex      uint64
+	cooldowns         map[string]time.Time       // 账号冷却时间
+	errorCounts       map[string]int             // 连续错误计数
+	authFailureCounts map[string]int             // 连续认证失败计数
+	modelLists        map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	affinity          map[string]affinityBinding // session/conversation key → account
 }
 
 type affinityBinding struct {
@@ -39,10 +52,11 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
-			affinity:    make(map[string]affinityBinding),
+			cooldowns:         make(map[string]time.Time),
+			errorCounts:       make(map[string]int),
+			authFailureCounts: make(map[string]int),
+			modelLists:        make(map[string]map[string]bool),
+			affinity:          make(map[string]affinityBinding),
 		}
 		pool.Reload()
 	})
@@ -347,22 +361,206 @@ func (p *AccountPool) RecordSuccess(id string) {
 	defer p.mu.Unlock()
 	delete(p.cooldowns, id)
 	p.errorCounts[id] = 0
+	delete(p.authFailureCounts, id)
 }
 
-// RecordError 记录请求错误，设置冷却
-func (p *AccountPool) RecordError(id string, isQuotaError bool) {
+// RecordError 记录请求错误，设置冷却。retryAfter 为上游 Retry-After（0 表示仅用默认退避）。
+func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
+		cooldown := quotaBackoffDuration(p.errorCounts[id])
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
+		p.cooldowns[id] = time.Now().Add(cooldown)
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+// RecordAuthError records a consecutive auth failure and applies a long cooldown.
+// Returns the updated consecutive failure count.
+func (p *AccountPool) RecordAuthError(id string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.authFailureCounts[id]++
+	p.cooldowns[id] = time.Now().Add(authCooldownDuration)
+	return p.authFailureCounts[id]
+}
+
+// RecordAuthSuccess clears consecutive auth failure tracking for an account.
+func (p *AccountPool) RecordAuthSuccess(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.authFailureCounts, id)
+}
+
+// ParseRetryAfter extracts an upstream retry delay from an error message, if present.
+func ParseRetryAfter(msg string) time.Duration {
+	match := retryAfterPattern.FindStringSubmatch(msg)
+	if len(match) < 2 {
+		return 0
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	unit := strings.ToLower(strings.TrimSpace(match[2]))
+	switch unit {
+	case "m", "min", "mins", "minute", "minutes":
+		return time.Duration(value * float64(time.Minute))
+	case "h", "hr", "hrs", "hour", "hours":
+		return time.Duration(value * float64(time.Hour))
+	default:
+		return time.Duration(value * float64(time.Second))
+	}
+}
+
+func quotaBackoffDuration(consecutiveErrors int) time.Duration {
+	if consecutiveErrors < 1 {
+		consecutiveErrors = 1
+	}
+	d := quotaBackoffBase
+	for i := 1; i < consecutiveErrors; i++ {
+		d *= 2
+		if d >= quotaBackoffMax {
+			return quotaBackoffMax
+		}
+	}
+	if d > quotaBackoffMax {
+		return quotaBackoffMax
+	}
+	return d
+}
+
+// UnavailableReason returns a diagnostic message when no account can serve model.
+func (p *AccountPool) UnavailableReason(model string) string {
+	enabled := config.GetEnabledAccounts()
+	if len(enabled) == 0 {
+		return "No accounts configured"
+	}
+
+	modelKey := strings.ToLower(strings.TrimSpace(model))
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	allowOverUsage := config.GetAllowOverUsage()
+
+	activeCount := 0
+	for _, acc := range enabled {
+		if acc.Enabled {
+			activeCount++
+		}
+	}
+	if activeCount == 0 {
+		return "All accounts are disabled"
+	}
+
+	hasModelListData := false
+	modelSupportedCount := 0
+	alternatives := make(map[string]bool)
+	for _, acc := range enabled {
+		if !acc.Enabled {
+			continue
+		}
+		list, ok := p.modelLists[acc.ID]
+		if !ok || len(list) == 0 {
+			continue
+		}
+		hasModelListData = true
+		if modelKey == "" || list[modelKey] {
+			modelSupportedCount++
+		} else {
+			for id := range list {
+				alternatives[id] = true
+			}
+		}
+	}
+
+	if hasModelListData && modelKey != "" && modelSupportedCount == 0 {
+		if len(alternatives) > 0 {
+			altList := make([]string, 0, len(alternatives))
+			for id := range alternatives {
+				altList = append(altList, id)
+			}
+			if len(altList) > 5 {
+				altList = altList[:5]
+			}
+			return fmt.Sprintf("No account supports model %q; try: %s", model, strings.Join(altList, ", "))
+		}
+		return fmt.Sprintf("No account supports model %q", model)
+	}
+
+	var earliestCooldown time.Time
+	hasEarliest := false
+	routableCount := 0
+	unavailableCount := 0
+
+	for _, acc := range enabled {
+		if !acc.Enabled {
+			continue
+		}
+		if hasModelListData && modelKey != "" {
+			if list, ok := p.modelLists[acc.ID]; ok && len(list) > 0 && !list[modelKey] {
+				continue
+			}
+		}
+
+		routableCount++
+		reasons := 0
+		if isQuotaBlocked(acc, allowOverUsage) {
+			reasons++
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			reasons++
+			if !hasEarliest || cooldown.Before(earliestCooldown) {
+				earliestCooldown = cooldown
+				hasEarliest = true
+			}
+		}
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			reasons++
+		}
+		if reasons > 0 {
+			unavailableCount++
+		}
+	}
+
+	if routableCount == 0 {
+		if hasModelListData && modelKey != "" {
+			return fmt.Sprintf("No account supports model %q", model)
+		}
+		return "No accounts configured"
+	}
+
+	if unavailableCount >= routableCount {
+		if hasEarliest {
+			wait := time.Until(earliestCooldown).Round(time.Second)
+			if wait < time.Second {
+				wait = time.Second
+			}
+			return fmt.Sprintf("All accounts temporarily unavailable; retry in %s", formatRetryHint(wait))
+		}
+		return "All accounts are in cooldown or have exhausted quota"
+	}
+
+	return "No available accounts"
+}
+
+func formatRetryHint(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh", int(d.Hours()))
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials

@@ -215,7 +215,7 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.sendOpenAIError(w, 503, "server_error", h.pool.UnavailableReason(model))
 		return
 	}
 	h.recordFailure()
@@ -574,7 +574,7 @@ func (h *Handler) handleResponsesStream(
 				"status": "failed",
 				"error": map[string]string{
 					"type":    "server_error",
-					"message": "No available accounts",
+					"message": h.pool.UnavailableReason(model),
 				},
 			},
 		})

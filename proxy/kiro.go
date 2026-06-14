@@ -319,6 +319,12 @@ func getSortedEndpoints(preferred, region string) []kiroEndpoint {
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	// Kiro Secret Key (ksk_) accounts cannot sign data-plane requests directly;
+	// route them through the kiro-cli subprocess bridge instead.
+	if isApiKeyAccount(account) {
+		return callKiroViaCliBridge(account, payload, callback)
+	}
+
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn

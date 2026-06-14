@@ -1907,7 +1907,8 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-fingerprint'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -1931,6 +1932,7 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -1950,6 +1952,7 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2001,6 +2004,28 @@
       '</div>';
     $('iamBtn').addEventListener('click', startIamSso);
   }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="help-block">' +
+      '<p><b>' + escapeHtml(t('apikey.howToGet')) + '</b></p>' +
+      '<ol class="steps-list">' +
+      '<li>' + escapeHtml(t('apikey.step1')) + '</li>' +
+      '<li>' + escapeHtml(t('apikey.step2')) + '</li>' +
+      '</ol>' +
+      '</div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nicknameLabel')) + '</label>' +
+      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + ' <small>' + escapeHtml(t('apikey.keyHint')) + '</small></label>' +
+      '<textarea id="apiKeyValue" class="font-mono" placeholder="' + escapeAttr(t('apikey.keyPlaceholder')) + '"></textarea></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
+  }
+
   function modalSso(title, body) {
     title.textContent = t('modal.ssoTitle');
     body.innerHTML =
@@ -2255,6 +2280,33 @@
       autoRefreshNewAccount(d.account?.id);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
+  async function importApiKey() {
+    const apiKey = $('apiKeyValue').value.trim();
+    if (!apiKey) { toastWarning(t('apikey.keyMissing')); return; }
+    const btn = $('importApiKeyBtn');
+    if (btn) { btn.disabled = true; }
+    try {
+      const res = await api('/auth/apikey', {
+        method: 'POST', body: JSON.stringify({
+          apiKey: apiKey,
+          nickname: $('apiKeyNickname').value.trim()
+        })
+      });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        const count = d.accounts?.length || 0;
+        const errs = d.errors?.length || 0;
+        let msg = t('apikey.importSuccess', count);
+        if (errs > 0) msg += t('apikey.importPartial', errs);
+        toastPrimary(msg, { duration: 5200 });
+        if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
+      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    } finally {
+      if (btn) { btn.disabled = false; }
+    }
+  }
+
   async function importSsoToken() {
     const res = await api('/auth/sso-token', {
       method: 'POST', body: JSON.stringify({

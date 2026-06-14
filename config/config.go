@@ -45,8 +45,9 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "apikey" (Kiro Secret Key via kiro-cli bridge)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
+	ApiKey       string `json:"apiKey,omitempty"`       // Kiro Secret Key (ksk_...) used by the kiro-cli bridge when AuthMethod == "apikey"
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"kiro-go/config"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,10 +173,11 @@ func TestIsSuspensionErrorNilError(t *testing.T) {
 
 func newTestPool(accounts ...config.Account) *AccountPool {
 	p := &AccountPool{
-		cooldowns:   make(map[string]time.Time),
-		errorCounts: make(map[string]int),
-		modelLists:  make(map[string]map[string]bool),
-		affinity:    make(map[string]affinityBinding),
+		cooldowns:         make(map[string]time.Time),
+		errorCounts:       make(map[string]int),
+		authFailureCounts: make(map[string]int),
+		modelLists:        make(map[string]map[string]bool),
+		affinity:          make(map[string]affinityBinding),
 	}
 	p.accounts = accounts
 	return p
@@ -380,5 +382,150 @@ func TestReloadKeepsOverQuotaAccountWhenAllowOverUsageSavedDisabled(t *testing.T
 
 	if got := p.GetNext(); got == nil || got.ID != "over" {
 		t.Fatalf("expected over-quota account to remain routable with hard-coded over-usage, got %#v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Quota backoff / retry-after
+// ---------------------------------------------------------------------------
+
+func TestRecordErrorQuotaUsesExponentialBackoff(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+
+	expected := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 20 * time.Second}
+	for i, want := range expected {
+		before := time.Now()
+		p.RecordError("a", true, 0)
+		p.mu.RLock()
+		cooldown := p.cooldowns["a"]
+		p.mu.RUnlock()
+		if got := cooldown.Sub(before).Round(time.Second); got != want {
+			t.Fatalf("attempt %d: expected backoff %s, got %s", i+1, want, got)
+		}
+	}
+}
+
+func TestRecordErrorQuotaHonorsRetryAfter(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+
+	before := time.Now()
+	p.RecordError("a", true, 45*time.Second)
+	p.mu.RLock()
+	cooldown := p.cooldowns["a"]
+	p.mu.RUnlock()
+
+	if got := cooldown.Sub(before).Round(time.Second); got != 45*time.Second {
+		t.Fatalf("expected retry-after 45s to win over default backoff, got %s", got)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want time.Duration
+	}{
+		{"HTTP 429 retry-after: 30", 30 * time.Second},
+		{"please retry after 2 minutes", 2 * time.Minute},
+		{"Retry-After=1h", time.Hour},
+		{"no hint here", 0},
+		{"retry-after: 0", 0},
+	}
+	for _, tc := range cases {
+		if got := ParseRetryAfter(tc.msg); got != tc.want {
+			t.Errorf("ParseRetryAfter(%q) = %s, want %s", tc.msg, got, tc.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Auth failure counting
+// ---------------------------------------------------------------------------
+
+func TestRecordAuthErrorCountsAndCoolsDown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+
+	before := time.Now()
+	if n := p.RecordAuthError("a"); n != 1 {
+		t.Fatalf("expected first auth failure count 1, got %d", n)
+	}
+	if n := p.RecordAuthError("a"); n != 2 {
+		t.Fatalf("expected second auth failure count 2, got %d", n)
+	}
+
+	p.mu.RLock()
+	cooldown := p.cooldowns["a"]
+	p.mu.RUnlock()
+	if cooldown.Sub(before) < 29*time.Minute {
+		t.Fatalf("expected ~30m auth cooldown, got %s", cooldown.Sub(before))
+	}
+
+	p.RecordAuthSuccess("a")
+	if n := p.RecordAuthError("a"); n != 1 {
+		t.Fatalf("expected count reset after RecordAuthSuccess, got %d", n)
+	}
+}
+
+func TestRecordSuccessClearsAuthFailures(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+	p.RecordAuthError("a")
+	p.RecordSuccess("a")
+	if n := p.RecordAuthError("a"); n != 1 {
+		t.Fatalf("expected auth failure count reset after RecordSuccess, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UnavailableReason diagnostics
+// ---------------------------------------------------------------------------
+
+func TestUnavailableReasonNoAccountsConfigured(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	p := newTestPool()
+	if got := p.UnavailableReason("claude-opus-4.8"); got != "No accounts configured" {
+		t.Fatalf("expected 'No accounts configured', got %q", got)
+	}
+}
+
+func TestUnavailableReasonModelUnsupported(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "a", Enabled: true, Email: "a@test"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	p := newTestPool()
+	p.Reload()
+	p.SetModelList("a", []string{"claude-opus-4.7"})
+
+	got := p.UnavailableReason("claude-opus-4.8")
+	if !strings.Contains(got, "No account supports model") {
+		t.Fatalf("expected unsupported-model message, got %q", got)
+	}
+	if !strings.Contains(got, "claude-opus-4.7") {
+		t.Fatalf("expected alternative model suggestion, got %q", got)
+	}
+}
+
+func TestUnavailableReasonAllCooling(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "a", Enabled: true, Email: "a@test"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	p := newTestPool()
+	p.Reload()
+	p.mu.Lock()
+	p.cooldowns["a"] = time.Now().Add(30 * time.Second)
+	p.mu.Unlock()
+
+	got := p.UnavailableReason("claude-opus-4.8")
+	if !strings.Contains(got, "retry in") {
+		t.Fatalf("expected cooldown retry hint, got %q", got)
 	}
 }

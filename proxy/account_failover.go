@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"strings"
 	"time"
 )
@@ -88,6 +90,37 @@ func (h *Handler) disableAccountOverage(account *config.Account) {
 	h.pool.Reload()
 }
 
+func (h *Handler) handleAuthFailure(account *config.Account, err error) {
+	if account == nil || err == nil {
+		return
+	}
+
+	accessToken, refreshToken, expiresAt, profileArn, refreshErr := auth.RefreshToken(account)
+	if refreshErr == nil {
+		h.pool.UpdateToken(account.ID, accessToken, refreshToken, expiresAt)
+		account.AccessToken = accessToken
+		if refreshToken != "" {
+			account.RefreshToken = refreshToken
+		}
+		account.ExpiresAt = expiresAt
+		if profileArn != "" {
+			account.ProfileArn = profileArn
+			config.UpdateAccountProfileArn(account.ID, profileArn)
+		}
+		config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
+		h.pool.RecordAuthSuccess(account.ID)
+		logger.Infof("[AccountFailover] Refreshed token for %s after auth error", account.Email)
+		return
+	}
+
+	failures := h.pool.RecordAuthError(account.ID)
+	logger.Warnf("[AccountFailover] Auth failure for %s (%d consecutive): %v", account.Email, failures, err)
+
+	if failures >= pool.AuthFailureBanThreshold {
+		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+	}
+}
+
 func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	if account == nil || err == nil {
 		return
@@ -97,19 +130,20 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	switch {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
-		h.pool.RecordError(account.ID, false)
+		h.pool.RecordError(account.ID, false, 0)
 	case isQuotaErrorMessage(errMsg):
-		h.pool.RecordError(account.ID, true)
+		retryAfter := pool.ParseRetryAfter(errMsg)
+		h.pool.RecordError(account.ID, true, retryAfter)
 	case isSuspensionErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
 	case isProfileUnavailableErrorMessage(errMsg):
 		// Profile ARN may be transiently unresolvable (upstream blip, stale token).
 		// Treat as a soft failure: short cooldown so the next request rotates account,
 		// but never auto-disable — operators can still investigate via warn logs.
-		h.pool.RecordError(account.ID, false)
+		h.pool.RecordError(account.ID, false, 0)
 	case isAuthErrorMessage(errMsg):
-		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+		h.handleAuthFailure(account, err)
 	default:
-		h.pool.RecordError(account.ID, false)
+		h.pool.RecordError(account.ID, false, 0)
 	}
 }
